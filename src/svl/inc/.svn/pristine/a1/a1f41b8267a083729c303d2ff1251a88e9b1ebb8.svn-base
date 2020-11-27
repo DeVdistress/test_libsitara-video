@@ -1,0 +1,518 @@
+/*
+ * videoenclib.h
+ *
+ *  Created on: 15 мая 2020 г.
+ *      Author: dimus
+ */
+
+#ifndef VIDEOENCLIB_INC_VIDEOENCLIB_H_
+#define VIDEOENCLIB_INC_VIDEOENCLIB_H_
+
+#include <string>
+#include <thread>
+#include <mutex>
+#include <atomic>
+#include <condition_variable>
+#include <queue>
+#include <list>
+
+/* align x to next highest multiple of 2^n */
+#define ALIGN2(x, n)   (((x) + ((1 << (n)) - 1)) & ~((1 << (n)) - 1))
+
+namespace VideoEncLib {
+
+//////////////////////////////////////////////////////////////////////////////////
+//		Прямоугольник															//
+//////////////////////////////////////////////////////////////////////////////////
+struct Rectangle
+{
+	Rectangle (uint32_t x_= 0, uint32_t y_= 0, uint32_t w_= 0, uint32_t h_= 0) : x{x_}, y{y_}, w{w_}, h{h_}{}
+	uint32_t x;
+	uint32_t y;
+	uint32_t w;
+	uint32_t h;
+};
+
+//////////////////////////////////////////////////////////////////////////////////
+//		Интерфейс OMAP буфера													//
+//////////////////////////////////////////////////////////////////////////////////
+class IOmapBuffer
+{
+public:
+	virtual int		dmaBuf() const noexcept = 0;
+	virtual size_t	size() const noexcept = 0;
+	virtual void *	dataMap() const	noexcept = 0;
+	virtual 		~IOmapBuffer()	{	}
+};
+
+//////////////////////////////////////////////////////////////////////////////////
+//		Интерфейс фрейм буфера													//
+//////////////////////////////////////////////////////////////////////////////////
+class IFrameBuffer
+{
+public:
+	virtual IOmapBuffer *	yBuff() = 0; 	//buffer object for y pointer
+	virtual IOmapBuffer *	uvBuff() = 0;	//buffer object for uv pointer
+	virtual 				~IFrameBuffer()		{	}
+};
+
+using FrameBufferQueue = std::queue<IFrameBuffer *>;
+
+//////////////////////////////////////////////////////////////////////////////////
+//		Абстрактный источник "сырых" видеокадров								//
+//////////////////////////////////////////////////////////////////////////////////
+class AbstractFrameSource
+{
+public:
+	virtual int				frameWidth() const	noexcept = 0;
+	virtual int				frameHeight() const	noexcept = 0;
+	virtual int				fps() const	noexcept = 0;
+	virtual IFrameBuffer *	waitFrame() = 0;				//ожидание нового фрейма. nullptr свидетельствует об окончании работы источника(ошибка, завершение данных, выключение и т.п.)
+	virtual void			endingProcessFrameNotify() = 0;	//отправка уведомления о завершении обработки фрейма(необходимо вызывать после обработки фрейма)
+	virtual bool			start() = 0;					//запуск источника, true при успешном запуске
+	virtual void			stop() = 0;						//останов источника
+	virtual bool			isRun() const = 0;
+	virtual					~AbstractFrameSource()	{	}
+};
+
+//////////////////////////////////////////////////////////////////////////////////
+//		OMAP буфер																//
+//////////////////////////////////////////////////////////////////////////////////
+class OmapBuffer : public IOmapBuffer
+{
+public:
+			OmapBuffer(void * deviceHandle, int size);
+			OmapBuffer()				{					}
+	int		dmaBuf() const noexcept		{ return _dmaBuf;	}
+	size_t	size() const noexcept		{ return _size;		}
+	void *	dataMap() const	noexcept	{ return _dataMap;	}	//Адрес отображения OMAP-буфера к которому может обращаться ЦП
+			~OmapBuffer();
+private:
+	void *	_data{nullptr};		//buffer object for pointer
+	int		_dmaBuf{0};			//dma buf
+	size_t	_size;				//size
+	void *	_dataMap{nullptr};	// Virtual addresses of data
+};
+
+//////////////////////////////////////////////////////////////////////////////////
+//		Буфер для кадра в формате NV12											//
+//////////////////////////////////////////////////////////////////////////////////
+// Видео формат NV12
+// Данные о пикселях храняться в двух массивах: яркость(Y) и цветность(UV) (голубой и красный) 12 бит на писксель
+// Один пиксель: YYYYYYYY UVUV
+// Два пикселя: YYYYYYYYYYYYYYYY UVUVUVUV
+class FrameBuffer : public IFrameBuffer
+{
+public:
+					FrameBuffer(void * deviceHandle, int width, int height);//throw exception std::string
+	IOmapBuffer *	yBuff()			{ return _yBuff;			}			//buffer object for y pointer
+	IOmapBuffer *	uvBuff()		{ return _uvBuff;			}			//buffer object for uv pointer
+	uint			lock(uint count = 1);									//увеличение счетчика ссылок на буфер
+	uint			unlock(uint count = 1);									//увеличение счетчика ссылок на буфер
+	uint			lockCount() const;
+					~FrameBuffer();
+
+private:
+	OmapBuffer *		_yBuff;		//buffer object for y pointer
+	OmapBuffer *		_uvBuff;	//buffer object for uv pointer
+	mutable std::mutex	_lockCountMutex;
+	uint				_lockCount{0};
+};
+
+//////////////////////////////////////////////////////////////////////////////////
+//		Источник "сырых" видеокадров 											//
+//		Расчитан только на одного потребителя									//
+//		Для нескольких потребителей используйте FrameDistributer					//
+//////////////////////////////////////////////////////////////////////////////////
+class FrameSource : public AbstractFrameSource
+{
+public:
+					FrameSource(int frameWidth, int frameHeight, int fps, int bufferPoolSize = 1);
+					//Входной буфер задается  в Мб, поэтому размер фрейма  автоматически округляется в большую сторону до Мб
+	int				frameWidth() const	noexcept override	{ return _frameWidth;	}
+	int				frameHeight() const	noexcept override	{ return _frameHeight;	}
+	int				fps() const	noexcept override			{ return _fps; 			}	//Frame rate
+	IFrameBuffer *	waitFrame() override;					//ожидание нового фрейма. nullptr свидетельствует об окончании работы источника(ошибка, завершение данных, выключение и т.п.)
+	void			endingProcessFrameNotify() override;	//отправка уведомления о завершении обработки фрейма(необходимо вызывать после обработки фрейма)
+
+	bool			start() override;						//запуск источника, true при успешном запуске
+	void			stop() override;							//останов источника
+	bool			isRun() const override					{ return _isRun;		}
+	virtual			~FrameSource();
+
+protected:
+					FrameSource();
+	void			init(int frameWidth, int frameHeight, int fps, int bufferPoolSize, int paddedWidth, int paddedHeight);
+	IFrameBuffer *	waitBufferFromPool();							//ожидания появления буфера в пуле свободных
+	void			endingBufferFill(IFrameBuffer *buffer, bool ok);	//окончание заполнения буфера(вызывать после заполнения буфера)
+	void			returnBufferToPool(IFrameBuffer *buffer);		//возврат буфера в пул свободных. Используется только если замещается endingProcessFrameNotify
+	IFrameBuffer *	currentBuffer() const;
+	virtual bool	doStart() = 0;									//запуск источника, true при успешном запуске
+	virtual void	doStop() = 0;									//останов источника
+
+private:
+	int							_frameWidth;
+	int							_frameHeight;
+	int							_fps; 							//Frame rate
+	bool						_isRun{false};
+	bool						_end{false};
+	std::mutex					_startMutex;
+	IFrameBuffer *				_currentBuffer{nullptr};		//текущий обрабатываемый буфер
+
+	std::condition_variable		_freeBufferCondition;			//условие появления свободного буфера
+	FrameBufferQueue			_frameBufferPool;				//пул свободных буферов
+	FrameBufferQueue			_frameBufferQueue;				//все буферы(для освобождения памяти)
+	std::mutex					_frameBufferPoolMutex;
+
+	FrameBufferQueue			_processingQueue;				//очередь обработки
+	mutable std::mutex			_processingQueueMutex;
+	std::condition_variable		_processingQueueFillCondition;	//условие наполнения очереди обработки
+};
+
+//////////////////////////////////////////////////////////////////////////////////
+//		Дистрибьютор фреймов 													//
+//////////////////////////////////////////////////////////////////////////////////
+class ProxyFrameSource;
+
+class FrameDistributer
+{
+public:
+							FrameDistributer(AbstractFrameSource * source);
+	AbstractFrameSource *	registerConsumer();
+	void					unregisterConsumer(AbstractFrameSource *source);
+	void					start();
+	void					stop();
+							~FrameDistributer();
+
+private:
+	 static void	distributerThreadBody(FrameDistributer &frameDistributer);
+	 void			distributerThreadBodyThis();
+	 IFrameBuffer *	waitFrame(ProxyFrameSource * proxy);
+	 void			endingProcessFrameNotify();
+
+private:
+	AbstractFrameSource *				_source;
+	std::list<AbstractFrameSource *>	_consumers;
+	std::mutex							_startMutex;
+	size_t								_waitersCount{0};				//количество ожидающих потребителей
+	std::mutex							_waitersCountMutex;
+	std::condition_variable				_waitersCountCondition;
+
+	std::thread *						_distributerThread{nullptr};	//поток дестрибьютера(управляет последовательной обработкой буферов)
+	bool								_needEnd{false};					//флаг завершения работы
+
+	int									_noEndingConsumersCount{0};		//количество потребителей не закончивших обработку
+	std::mutex							_noEndingConsumersCountMutex;
+	std::condition_variable				_endingConsumersCondition;		//условие завершения обработки всеми потребителями
+
+	IFrameBuffer *						_currentBuffer{nullptr};		//текущий обрабатываемый буфер
+	std::mutex							_currentBufferMutex;
+
+	bool 								_waitState{false};
+	std::mutex							_frameReadyMutex;
+	std::condition_variable				_frameReadyCondition;
+	friend ProxyFrameSource;
+};
+
+//////////////////////////////////////////////////////////////////////////////////
+//		Виды поддерживаемых кодеков											//
+//////////////////////////////////////////////////////////////////////////////////
+enum class CodecKind
+{
+	H264,
+	H263,
+	Mpeg4,
+	Jpeg,
+	Unknown
+};
+
+int	codecKind2AvCodecId(CodecKind codecKind);	//соответствие CodecKind кодеку FFMPEG
+CodecKind avCodecId2CodecKind(int avCodecId);	//соответствие кодека FFMPEG CodecKind
+
+//////////////////////////////////////////////////////////////////////////////////
+//		Настройки кодировщика													//
+//////////////////////////////////////////////////////////////////////////////////
+class EncoderSettings
+{
+public:
+	CodecKind			codec() const noexcept		{ return _codec;		}
+	int					profile() const noexcept	{ return _profile;		}
+	int 				level() const noexcept		{ return _level;		}
+	int					bitRate() const	noexcept	{ return _bitRate;		}	//в битах/с
+
+protected:
+						EncoderSettings(CodecKind codec, int bitRate);
+	int					_profile{0};
+	int 				_level{0};
+
+private:
+	CodecKind			_codec;
+	int					_bitRate;
+};
+
+//////////////////////////////////////////////////////////////////////////////////
+//		Приемник кодированных данных											//
+//////////////////////////////////////////////////////////////////////////////////
+class Sink
+{
+public:
+					Sink();
+	virtual	bool	writeData(void * data, int size) = 0;
+	virtual			~Sink();
+};
+
+//////////////////////////////////////////////////////////////////////////////////
+//		Кодировщик																//
+//////////////////////////////////////////////////////////////////////////////////
+class Encoder
+{
+public:
+	Encoder();
+	void			start(EncoderSettings & encoderSettings, AbstractFrameSource * frameSource, Sink & sink);	//Запуск потока кодирования
+	void			stop();																				//Выставление флага прерывание потока кодирвания
+	void			waitEnd();																			//Ожидание завершения потока кодирования
+	bool			isRunning() const;																	//Выполняется кодирование
+	std::string		lastError() const noexcept		{ return _lastError;	}
+
+private:
+	static void		threadBody(Encoder & encoder, EncoderSettings & encoderSettings, AbstractFrameSource & frameSource, Sink & sink);
+
+private:
+	std::thread *	_thread{nullptr};
+	std::mutex		_mutex;
+	bool			_needStop{false};
+	std::string		_lastError;
+};
+
+
+//////////////////////////////////////////////////////////////////////////////////
+//		Настройки кодировщика H264												//
+//////////////////////////////////////////////////////////////////////////////////
+class H264EncoderSettings : public EncoderSettings
+{
+public:
+	enum class Profile
+	{
+		Baseline,
+		High
+	};
+
+	enum class Level
+	{
+		_10,
+		_1b,
+		_11,
+		_12,
+		_13,
+		_20,
+		_21,
+		_22,
+		_30,
+		_31,
+		_32,
+		_40,
+		_41,
+		_42,
+		_50,
+		_51
+	};
+
+public:
+	H264EncoderSettings(int bitRate, Profile profile, Level level);
+};
+
+//////////////////////////////////////////////////////////////////////////////////
+//		Настройки кодировщика H263												//
+//////////////////////////////////////////////////////////////////////////////////
+class H263EncoderSettings : public EncoderSettings
+{
+public:
+	enum class Level
+	{
+		_10,
+		_20,
+		_30,
+		_40,
+		_45,
+		_50,
+		_60,
+		_70
+	};
+
+public:
+	H263EncoderSettings(int bitRate, Level level);
+};
+
+//////////////////////////////////////////////////////////////////////////////////
+//		Настройки кодировщика Mpeg4												//
+//////////////////////////////////////////////////////////////////////////////////
+class Mpeg4EncoderSettings : public EncoderSettings
+{
+public:
+	enum class Level
+	{
+		_0,
+		_0B,
+		_1,
+		_2,
+		_3,
+		_4A,
+		_5,
+		_6
+	};
+
+public:
+	Mpeg4EncoderSettings(int bitRate, Level level);
+};
+
+//////////////////////////////////////////////////////////////////////////////////
+//		Настройки кодировщика Jpeg												//
+//////////////////////////////////////////////////////////////////////////////////
+class JpegEncoderSettings : public EncoderSettings
+{
+public:
+	JpegEncoderSettings(int bitRate);
+};
+
+
+//////////////////////////////////////////////////////////////////////////////////
+//		Приемник данных в AVI-контейнер на основе FFMPEG							//
+//////////////////////////////////////////////////////////////////////////////////
+class FfmpegFileSinkPrivate;
+
+class FfmpegFileSink : public Sink
+{
+public:
+				FfmpegFileSink(const std::string& fileName, const VideoEncLib::EncoderSettings & encoderSettings, const FrameSource * frameSource);
+	bool		writeData(void * data, int size) override;
+	size_t		dataSize() const	{ return _dataSize;	}
+	bool		writeAVPacket(void * avpacket, void * srcStream);
+	virtual		~FfmpegFileSink();
+
+private:
+	FfmpegFileSinkPrivate *	_p;
+	size_t					_dataSize{0};
+};
+
+//////////////////////////////////////////////////////////////////////////////////
+//			Видеорегистратор													//
+//			Циклически пишет в последовательность файлов в формате AVI			//
+//////////////////////////////////////////////////////////////////////////////////
+class Dvr : public Sink
+{
+public:
+			Dvr(const std::string &folderName, size_t maxFileSize, size_t maxFileCount, const EncoderSettings & encoderSettings, const FrameSource * frameSource);
+	bool	writeData(void * data, int size) override;
+			~Dvr();
+private:
+	std::string						genFileName() const;
+	void							freeFileSink();
+	static void						removeOldestFile(Dvr &dvr);
+	void							freeThread();
+
+private:
+	std::string			_folderName;
+	size_t				_maxFileSize;
+	size_t				_maxFileCount;
+	FfmpegFileSink *	_fileSink{nullptr};
+	std::mutex			_mutex;
+	std::thread *		_thread{nullptr};
+	std::string			_fsError;	//ошибка переданная из потока удаления файла
+	std::atomic<bool>	_fsErrorFlag{false};
+	EncoderSettings		_encoderSettings;
+	const FrameSource * _frameSource;
+};
+
+//////////////////////////////////////////////////////////////////////////////////
+//		Передатчик видео через RTP												//
+//////////////////////////////////////////////////////////////////////////////////
+class RtpSinkPrivate;
+
+class RtpSink : public Sink
+{
+public:
+					RtpSink(const std::string &address, uint port, const EncoderSettings & encoderSettings, const FrameSource * frameSource,
+							const std::string &outSdpFileName = std::string());
+	bool			writeData(void * data, int size) override;
+					~RtpSink();
+private:
+	RtpSinkPrivate *	_p;
+};
+
+//////////////////////////////////////////////////////////////////////////////////
+//		Источник кодированного видео											//
+//////////////////////////////////////////////////////////////////////////////////
+class EncodingVideoSource
+{
+public:
+	int					frameWidth() const	noexcept	{ return _frameWidth;	}
+	int					frameHeight() const	noexcept	{ return _frameHeight;	}
+	int					fps() const	noexcept			{ return _fps; 			}	//Frame rate
+	CodecKind			codecKind() const	noexcept	{ return _codecKind;	}
+	virtual int64_t 	bytesAvailable() = 0;
+	virtual int64_t		read(uint8_t* destination, int64_t maxSize) = 0;
+	virtual bool		atEnd() = 0;
+
+protected:
+	int					_frameWidth{-1};
+	int					_frameHeight{-1};
+	int					_fps{-1};
+	CodecKind			_codecKind{CodecKind::Unknown};
+};
+
+//////////////////////////////////////////////////////////////////////////////////
+//		Читатель файла FFMPEG													//
+//////////////////////////////////////////////////////////////////////////////////
+class FfmpegFileReaderPrivate;
+
+class FfmpegFileReader : public EncodingVideoSource
+{
+public:
+	FfmpegFileReader(const std::string& fileName);
+	~FfmpegFileReader();
+
+public: //EncodingVideoSource
+	int64_t 	bytesAvailable() override;
+	int64_t		read(uint8_t* destination, int64_t maxSize) override;
+	bool		atEnd() override;
+
+private:
+	FfmpegFileReaderPrivate	* _p;
+};
+
+//////////////////////////////////////////////////////////////////////////////////
+//		Декодировщик видео														//
+//////////////////////////////////////////////////////////////////////////////////
+class DecoderPrivate;
+
+class Decoder : public FrameSource
+{
+public:
+					Decoder(EncodingVideoSource * source);
+	void			endingProcessFrameNotify() override;
+	Rectangle		activeFrameRegion() const noexcept	{ return _activeFrameRegion;	}
+					~Decoder();
+
+protected:
+	virtual bool	doStart() override;	//запуск источника, true при успешном запуске
+	virtual void	doStop() override;	//останов источника
+
+private:
+	static void		threadBody(Decoder & decoder, EncodingVideoSource & encodingVideoSource);
+	int				decoder_process();
+	void			freed();
+	void			unlockBuf(FrameBuffer *buf);
+
+private:
+	EncodingVideoSource *	_source;
+	std::thread *			_thread{nullptr};
+	std::mutex				_mutex;
+	bool					_needStop{false};
+	std::string				_lastError;
+	DecoderPrivate *		_p;
+	Rectangle				_activeFrameRegion;
+};
+
+} /* namespace VideoEncLib */
+
+#endif /* VIDEOENCLIB_INC_VIDEOENCLIB_H_ */

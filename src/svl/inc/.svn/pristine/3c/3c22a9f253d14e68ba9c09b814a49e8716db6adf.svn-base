@@ -1,0 +1,82 @@
+// drm_visual.h
+//
+//  Created on: 31 авг. 2020 г.
+//      Author: devdistress
+//
+#pragma once
+
+#include "pattern_singleton.h"
+#include "wrap_iframebuffer_for_venclib.h"
+
+#include <kms++/kms++.h>
+#include <kms++util/kms++util.h>
+#include <kms++/omap/omapkms++.h>
+
+#include <utility>
+#include <mutex>
+
+namespace svl
+{
+	template <class T>
+	struct Rectangle
+	{
+		Rectangle (T x_, T y_, T w_, T h_):
+			x(x_), y(y_), w(w_), h(h_){}
+		T x;
+		T y;
+		T w;
+		T h;
+	};
+
+	class DRMvisual: public SingletonPattern<DRMvisual>
+	{
+	 public:
+		using ListOfPlanesDef	= std::vector<kms::Plane*>;
+		using OutXYDef			= std::pair<uint32_t , uint32_t>;
+		using OutWHDef			= OutXYDef;
+		using InWHDef			= OutXYDef;
+
+	 private:
+		DRMvisual			(const DRMvisual &src)	= delete;
+		DRMvisual& operator=(const DRMvisual &rhs)	= delete;
+
+		kms::PixelFormat			pixfmt	 { kms::PixelFormat::YUYV };
+		std::unique_ptr<kms::Card>	ptr_card { nullptr };
+		kms::Connector				*ptr_conn{ nullptr };
+		kms::Crtc					*ptr_crt { nullptr };
+		ListOfPlanesDef				available_planes;
+
+		std::mutex 					g_lock;
+
+		void getNecessaryPlane();
+		void addInit(const kms::PixelFormat &pixfmt_);
+
+	 public:
+		DRMvisual() 		= default;
+		virtual ~DRMvisual()= default;
+		void init(const kms::PixelFormat &pixfmt_ = kms::PixelFormat::YUYV);
+		void initOmap(const kms::PixelFormat &pixfmt_ = kms::PixelFormat::YUYV);
+
+		bool initPlane(
+						kms::Plane			*plane,
+						kms::Framebuffer	*m_fb,
+						Rectangle<uint32_t>	display,
+						Rectangle<uint32_t>	video
+					  );
+		bool initPlane(
+						kms::Plane					*plane,
+						VideoEncLib::IFrameBuffer	*m_fb,
+						VideoEncLib::Rectangle		display,
+						VideoEncLib::Rectangle		video
+					  );
+
+		void addFbIdToPlane(kms::Plane *plane, kms::Framebuffer	*m_fb);
+		void addFbIdToPlane(kms::Plane *plane, VideoEncLib::IFrameBuffer *m_fb);
+
+		kms::Card *const			getCard()			const { return ptr_card.get();}
+		const kms::Connector *const	getConnector()		const { return ptr_conn;}
+		const kms::Crtc *const		getCrtc()			const { return ptr_crt;}
+		const kms::PixelFormat&		getPixFmt()			const { return pixfmt;}
+		const ListOfPlanesDef&		getAvailablePlanes()const { return available_planes;}
+	};
+}
