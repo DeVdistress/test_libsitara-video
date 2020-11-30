@@ -1,0 +1,6 @@
+[submodule "ext/libsitara-video"]
+	path = ext/libsitara-video
+	url = https://github.com/DeVdistress/libsitara-video
+[submodule "ext/VideoEncoding"]
+	path = ext/VideoEncoding
+	url = https://github.com/DimusSM/VideoEncoding
