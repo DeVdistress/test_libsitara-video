@@ -1,7 +1,7 @@
 EXECUTABLE  = test_video_cap_and_drm
 
 SRCDIR        = src src/nix_console
-INCLUDEDIR    = $(SRCDIR) src/kms++/inc src/kms++util/inc src/svl/inc src/videoenclib/inc
+INCLUDEDIR    = $(SRCDIR) ext/libsitara-video/src/kms++/inc ext/libsitara-video/src/kms++util/inc ext/libsitara-video/src/svl/inc ext/libsitara-video/ext/VideoEncoding/VideoEncLib/inc
 INCLUDEDIR   +=/home/workspace/ti-processor-sdk-linux-am57xx-evm-05.02.00.10/linux-devkit/sysroots/armv7ahf-neon-linux-gnueabi/usr/include/omap 
 INCLUDEDIR   +=/home/workspace/ti-processor-sdk-linux-am57xx-evm-05.02.00.10/linux-devkit/sysroots/armv7ahf-neon-linux-gnueabi/usr/include/libdrm
 
